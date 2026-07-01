@@ -60,21 +60,101 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
+def recommend_tier(
+    hours_per_day: float,
+    interruptible: bool,
+    reserved_discount: float = 0.45,
+    gpu_type: str | None = None,
+    job_days: float | None = None,
+    catalog: dict | None = None,
+) -> str:
     """Pick a purchasing tier from a workload's duty cycle + interruptibility.
 
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
-      - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
-      - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
-      - otherwise                 -> 'on_demand' (spiky / low duty)
+    Advanced policy:
+      - Considers lock-in/obsolescence risk for cutting edge GPUs (like H100, H200, B200) vs utility GPUs.
+      - Short-lived workloads: if job_days is short (e.g. < 30 days) and it's not a continuous inference kind,
+        avoid reserved commitments and prefer on-demand or spot.
+      - Interruption rate and rework overhead: if spot interruption rate is too high and rework makes it
+        more expensive than reserved or on-demand, fallback.
     """
-    duty = max(0.0, hours_per_day) / 24.0
-    be = break_even_utilization(reserved_discount)
-    if interruptible and hours_per_day < 24:
-        return "spot"
-    if duty >= be:
-        return "reserved"
-    return "on_demand"
+    # 1. Interruption rate by GPU type (higher for older/smaller GPUs like A10G/L4, lower for enterprise H100)
+    INTERRUPT_RATES = {
+        "H100": 0.02,
+        "H200": 0.02,
+        "B200": 0.03,
+        "A100": 0.04,
+        "MI300X": 0.04,
+        "A10G": 0.07,
+        "L4": 0.08,
+    }
+
+    # If no advanced metadata is provided, fall back to basic logic to preserve compatibility and test stability.
+    if gpu_type is None or catalog is None or gpu_type not in catalog:
+        duty = max(0.0, hours_per_day) / 24.0
+        be = break_even_utilization(reserved_discount)
+        if interruptible and hours_per_day < 24:
+            return "spot"
+        if duty >= be:
+            return "reserved"
+        return "on_demand"
+
+    c = catalog[gpu_type]
+    od_price = float(c["on_demand_hr"])
+    spot_price = float(c["spot_hr"])
+    r3_price = float(c["reserved_3yr_hr"])
+    r1_price = float(c["reserved_1yr_hr"])
+
+    days = job_days if job_days is not None else 30.0
+    total_active_hours = hours_per_day * days
+
+    # Calculate expected spot cost if interruptible
+    spot_cost = float('inf')
+    if interruptible:
+        ir = INTERRUPT_RATES.get(gpu_type, 0.05)
+        sim = spot_checkpoint_cost(
+            job_hours=total_active_hours,
+            spot_hr=spot_price,
+            on_demand_hr=od_price,
+            interrupt_rate=ir
+        )
+        spot_cost = sim["spot_cost"]
+
+    # Lock-in risk and duration check for reserved
+    # For reserved, you commit to paying 24/7 for the duration of the workload/job.
+    is_cutting_edge = gpu_type in ["H100", "H200", "B200"]
+    reserved_rate = r1_price if is_cutting_edge else r3_price
+    reserved_cost = (24.0 * days) * reserved_rate
+    on_demand_cost = total_active_hours * od_price
+
+    # Compare costs to recommend the cheapest tier
+    costs = {
+        "on_demand": on_demand_cost,
+        "reserved": reserved_cost,
+    }
+    if interruptible:
+        costs["spot"] = spot_cost
+
+    best_tier = min(costs, key=costs.get)
+    return best_tier
+
+
+def cache_is_worth_it(
+    avg_cache_reads: float,
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+) -> bool:
+    """Evaluate if prompt caching saves money.
+
+    Caching is worth it if:
+    avg_cache_reads * (1 - read_discount) * input_cost > write_cost
+    If we assume write_cost is equal to input_cost per million tokens, this simplifies to:
+    avg_cache_reads * (1 - read_discount) > 1 => avg_cache_reads > 1 / (1 - read_discount).
+    With read_discount = 0.10, threshold is ~1.11 reads.
+    """
+    if avg_cache_reads <= 0:
+        return False
+    return avg_cache_reads * (1.0 - read_discount) > 1.0
+
 
 
 def spot_checkpoint_cost(

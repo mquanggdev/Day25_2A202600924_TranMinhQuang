@@ -26,12 +26,16 @@ def run(verbose: bool = True) -> dict:
         od = num(c["on_demand_hr"])
         on_demand_cost = gpu_hours * od
 
-        tier = pricing.recommend_tier(hpd, interruptible)
+        j_days = int(num(j["days"]))
+        tier = pricing.recommend_tier(hpd, interruptible, gpu_type=gtype, job_days=j_days, catalog=cat)
         if tier == "spot":
             sim = pricing.spot_checkpoint_cost(gpu_hours, num(c["spot_hr"]), od)
             opt_cost = sim["spot_cost"]
         elif tier == "reserved":
-            opt_cost = gpu_hours * num(c["reserved_3yr_hr"])
+            # If cutting-edge GPU, commit to 1-year reserved to avoid lock-in, else 3-year reserved.
+            is_cutting_edge = gtype in ["H100", "H200", "B200"]
+            price_key = "reserved_1yr_hr" if is_cutting_edge else "reserved_3yr_hr"
+            opt_cost = gpu_hours * num(c[price_key])
         else:
             opt_cost = on_demand_cost
 
@@ -43,6 +47,9 @@ def run(verbose: bool = True) -> dict:
     savings = on_demand_monthly - optimized_monthly
     savings_pct = savings / on_demand_monthly * 100 if on_demand_monthly else 0.0
 
+    from finops import sustainability
+    carbon_savings = sustainability.calculate_carbon_savings(jobs, cat)
+
     if verbose:
         print("== M3 Purchasing Strategy ==")
         print(f"break-even utilization @ 45% reserved discount = {pricing.break_even_utilization(0.45):.0%}")
@@ -50,9 +57,17 @@ def run(verbose: bool = True) -> dict:
         for r in recs:
             print(f"{r['job_id']:18}{r['gpu_type']:7}{r['tier']:11}${r['on_demand']:>11,}${r['optimized']:>11,}")
         print(f"\nmonthly: on-demand ${on_demand_monthly:,.0f} -> optimized ${optimized_monthly:,.0f}  ({savings_pct:.1f}% saved)")
+        
+        print("\n== Carbon-Aware Scheduling (Rescheduling Interruptible Jobs to europe-north1) ==")
+        print(f"Rescheduled jobs: {[j['job_id'] for j in jobs if bool(int(num(j['interruptible'])))]}")
+        print(f"Grid emissions: us-east-1 = {carbon_savings['us_carbon_g']/1e6:,.4f} tCO2e | europe-north1 = {carbon_savings['clean_carbon_g']/1e6:,.4f} tCO2e")
+        print(f"Carbon savings: {carbon_savings['carbon_saved_g']/1e6:,.4f} tCO2e ({ (1 - carbon_savings['clean_carbon_g']/carbon_savings['us_carbon_g']) * 100:.1f}% reduction)")
+        print(f"Electricity cost: us-east-1 = ${carbon_savings['us_cost_usd']:,.2f} | europe-north1 = ${carbon_savings['clean_cost_usd']:,.2f}")
+        print(f"Electricity cost savings: ${carbon_savings['cost_saved_usd']:,.2f} ({ (1 - carbon_savings['clean_cost_usd']/carbon_savings['us_cost_usd']) * 100:.1f}% saved)")
 
     return {"recommendations": recs, "on_demand_monthly": round(on_demand_monthly),
-            "optimized_monthly": round(optimized_monthly), "savings_pct": round(savings_pct, 1)}
+            "optimized_monthly": round(optimized_monthly), "savings_pct": round(savings_pct, 1),
+            "carbon_savings": carbon_savings}
 
 
 if __name__ == "__main__":

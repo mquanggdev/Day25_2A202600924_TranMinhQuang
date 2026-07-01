@@ -45,3 +45,64 @@ def tokens_per_watt(total_tokens: int, wh: float, seconds: float = 1.0) -> float
     """Energy efficiency of serving: tokens per watt (higher is better)."""
     watts = (wh * 3600.0) / seconds if seconds > 0 else 0.0
     return total_tokens / watts if watts > 0 else 0.0
+
+
+def calculate_carbon_savings(workloads: list[dict], catalog: dict) -> dict:
+    """Calculate potential carbon & electricity savings from migrating interruptible jobs to europe-north1.
+
+    Returns a dict with us_carbon_g, clean_carbon_g, carbon_saved_g, us_cost_usd, clean_cost_usd, cost_saved_usd.
+    """
+    us_carbon = 0.0
+    clean_carbon = 0.0
+    us_cost = 0.0
+    clean_cost = 0.0
+
+    for j in workloads:
+        # Check if the workload is interruptible (can be rescheduled)
+        try:
+            val = j.get("interruptible", "0")
+            interruptible = bool(int(float(val)))
+        except ValueError:
+            interruptible = False
+
+        if not interruptible:
+            continue
+
+        gtype = j["gpu_type"]
+        if gtype not in catalog:
+            continue
+
+        try:
+            ngpu = int(float(j["num_gpus"]))
+            hpd = float(j["hours_per_day"])
+            days = float(j["days"])
+        except ValueError:
+            continue
+
+        if days <= 0:
+            days = 30.0
+
+        # active GPU hours
+        active_hours = hpd * days * ngpu
+        watts = float(catalog[gtype].get("watts", 0.0))
+
+        # Total energy in Wh
+        energy_wh = active_hours * watts
+
+        # Carbon in grams
+        us_carbon += carbon_g(energy_wh, "us-east-1")
+        clean_carbon += carbon_g(energy_wh, "europe-north1")
+
+        # Electricity cost in USD
+        us_cost += energy_cost_usd(energy_wh, "us-east-1")
+        clean_cost += energy_cost_usd(energy_wh, "europe-north1")
+
+    return {
+        "us_carbon_g": round(us_carbon, 2),
+        "clean_carbon_g": round(clean_carbon, 2),
+        "carbon_saved_g": round(us_carbon - clean_carbon, 2),
+        "us_cost_usd": round(us_cost, 2),
+        "clean_cost_usd": round(clean_cost, 2),
+        "cost_saved_usd": round(us_cost - clean_cost, 2),
+    }
+
